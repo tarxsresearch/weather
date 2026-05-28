@@ -7,7 +7,7 @@ from datetime import datetime
 
 import httpx
 import socketio
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 # ─────────────────────────────────────────────
@@ -22,13 +22,29 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # CONFIG (from environment variables)
 # ─────────────────────────────────────────────
-ALERT_POLL_INTERVAL = int(os.getenv("ALERT_POLL_INTERVAL", "60"))  # seconds
+ALERT_POLL_INTERVAL = int(os.getenv("ALERT_POLL_INTERVAL", "60"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "100"))
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # e.g. "https://ennex.app"
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+
+# Gateway key — must match BACKEND_X_KEY in your master gateway
+GATEWAY_KEY = os.getenv("GATEWAY_KEY")
+
+# ─────────────────────────────────────────────
+# GATEWAY VERIFICATION
+# Only your master gateway can call this backend
+# ─────────────────────────────────────────────
+async def verify_gateway(request: Request):
+    """
+    Verifies every request came from the Ennex master gateway.
+    Rejects anything that doesn't carry the correct gateway key.
+    """
+    key = request.headers.get("X-Ennex-Backend-Key")
+    if not key or key != GATEWAY_KEY:
+        logger.warning(f"Unauthorized access attempt from {request.client.host}")
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 # ─────────────────────────────────────────────
 # IN-MEMORY STORE
-# Replace with Redis for multi-instance / persistent storage
 # ─────────────────────────────────────────────
 active_alerts: list[dict] = []
 processed_alert_ids: set[str] = set()
@@ -39,7 +55,7 @@ processed_alert_ids: set[str] = set()
 # ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Ennex backend starting...")
+    logger.info("🚀 Ennex weather backend starting...")
     task = asyncio.create_task(alert_monitor_loop())
     yield
     task.cancel()
@@ -74,9 +90,9 @@ socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
 # REST ENDPOINTS
 # ─────────────────────────────────────────────
 
+# Health stays PUBLIC — Render needs this to verify service is alive
 @app.get("/health")
 def health():
-    """Render uses this to check if the service is alive."""
     return {
         "status": "ok",
         "alerts_cached": len(active_alerts),
@@ -84,14 +100,15 @@ def health():
     }
 
 
+# All other routes protected by gateway verification
 @app.get("/api/weather")
 async def get_weather(
     lat: float = Query(..., description="Latitude"),
     lon: float = Query(..., description="Longitude"),
+    _=Depends(verify_gateway)  # ← gateway verification added
 ):
     """
     Live weather from Open-Meteo — completely free, no API key needed.
-    Covers the whole world.
     """
     url = (
         f"https://api.open-meteo.com/v1/forecast"
@@ -126,11 +143,7 @@ async def get_weather(
 
 
 @app.get("/api/alerts")
-def get_alerts():
-    """
-    REST fallback — returns all cached active alerts.
-    Prefer WebSocket (emergency_alert event) for real-time updates.
-    """
+def get_alerts(_=Depends(verify_gateway)):  # ← gateway verification added
     return {
         "count": len(active_alerts),
         "alerts": active_alerts,
@@ -139,8 +152,7 @@ def get_alerts():
 
 
 @app.get("/api/alerts/types")
-def get_alert_types():
-    """Returns the distinct alert types currently in cache."""
+def get_alert_types(_=Depends(verify_gateway)):  # ← gateway verification added
     types = list({a["type"] for a in active_alerts})
     return {"types": types}
 
@@ -150,30 +162,23 @@ def get_alert_types():
 # ─────────────────────────────────────────────
 
 async def alert_monitor_loop():
-    """
-    Polls 3 global disaster feeds every 60s.
-    Never crashes — catches all errors and keeps running.
-    """
     while True:
         try:
             logger.info("🔄 Polling global disaster feeds...")
             new_alerts: list[dict] = []
 
-            # Run all 3 feeds concurrently for speed
             await asyncio.gather(
-                _fetch_usgs(new_alerts),       # Earthquakes (global)
-                _fetch_gdacs(new_alerts),      # Cyclones, Floods, Tsunamis, Volcanoes
-                _fetch_nasa_eonet(new_alerts), # Wildfires, Storms, Sea events
+                _fetch_usgs(new_alerts),
+                _fetch_gdacs(new_alerts),
+                _fetch_nasa_eonet(new_alerts),
             )
 
             if new_alerts:
                 for alert in new_alerts:
                     logger.info(f"🚨 [{alert['type']}] {alert['title']}")
                     await sio.emit("emergency_alert", alert)
-
                 logger.info(f"✅ Broadcasted {len(new_alerts)} new alert(s).")
 
-            # Keep memory lean
             if len(active_alerts) > MAX_ALERTS:
                 active_alerts[:] = active_alerts[:MAX_ALERTS]
 
@@ -184,7 +189,7 @@ async def alert_monitor_loop():
 
 
 # ─────────────────────────────────────────────
-# FEED 1 — USGS (Earthquakes, Global, Mag 4.5+)
+# FEED 1 — USGS (Earthquakes)
 # ─────────────────────────────────────────────
 
 async def _fetch_usgs(new_alerts: list):
@@ -223,14 +228,10 @@ async def _fetch_usgs(new_alerts: list):
 
 
 # ─────────────────────────────────────────────
-# FEED 2 — GDACS (Cyclones, Floods, Tsunamis, Volcanoes, Earthquakes)
+# FEED 2 — GDACS
 # ─────────────────────────────────────────────
 
 async def _fetch_gdacs(new_alerts: list):
-    """
-    GDACS (Global Disaster Alert and Coordination System) — UN-backed.
-    RSS feed covers all major disaster types worldwide.
-    """
     url = "https://www.gdacs.org/xml/rss.xml"
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -254,17 +255,14 @@ async def _fetch_gdacs(new_alerts: list):
             pub_date = pub_el.text if pub_el is not None else datetime.utcnow().isoformat()
             description = desc_el.text if desc_el is not None else ""
 
-            # Build a stable ID from title + date
             alert_id = f"gdacs_{hash(title + str(pub_date))}"
             if alert_id in processed_alert_ids:
                 continue
             processed_alert_ids.add(alert_id)
 
-            # Detect event type from title
             event_type = _gdacs_event_type(title)
             severity = _gdacs_severity(title)
 
-            # Extract location from geo tags if available
             lat_el = item.find("geo:lat", ns)
             lon_el = item.find("geo:long", ns)
             location = "Global"
@@ -320,14 +318,10 @@ def _gdacs_severity(title: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# FEED 3 — NASA EONET (Wildfires, Storms, Sea & Ice Events)
+# FEED 3 — NASA EONET
 # ─────────────────────────────────────────────
 
 async def _fetch_nasa_eonet(new_alerts: list):
-    """
-    NASA Earth Observatory Natural Event Tracker.
-    Covers wildfires, tropical storms, volcanoes, sea/ice events globally.
-    """
     url = "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=20"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -343,7 +337,6 @@ async def _fetch_nasa_eonet(new_alerts: list):
             categories = [c["title"] for c in event.get("categories", [])]
             event_type = _eonet_event_type(categories)
 
-            # Get most recent geometry for location
             geometries = event.get("geometry", [])
             location = "Global"
             if geometries:
@@ -414,7 +407,6 @@ async def on_disconnect(sid):
 # ─────────────────────────────────────────────
 
 def _wmo_to_condition(code: int) -> str:
-    """WMO weather interpretation codes → human readable."""
     mapping = {
         0: "Clear Sky",
         1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
