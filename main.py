@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import os
@@ -102,13 +103,28 @@ async def get_weather(
         f"&hourly=relativehumidity_2m"
         f"&timezone=auto"
     )
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            data = r.json()
-    except httpx.HTTPError as e:
-        logger.error(f"Open-Meteo error: {e}")
+
+    data = None
+    last_error = None
+    # Retry on 429 (rate limited) — Render's shared free-tier IP can get
+    # throttled by Open-Meteo even though our own request rate is low.
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url)
+                if r.status_code == 429:
+                    last_error = "rate limited (429)"
+                    await asyncio.sleep(1 + attempt)  # 1s, 2s, 3s backoff
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+        except httpx.HTTPError as e:
+            last_error = str(e)
+            await asyncio.sleep(1 + attempt)
+
+    if data is None:
+        logger.error(f"Open-Meteo error after retries: {last_error}")
         raise HTTPException(status_code=502, detail="Weather service unavailable.")
 
     current = data.get("current_weather", {})
