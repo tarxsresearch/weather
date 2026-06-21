@@ -1,15 +1,11 @@
-import asyncio
 import hashlib
 import logging
 import os
 import xml.etree.ElementTree as ET
-from collections import deque
-from contextlib import asynccontextmanager
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
-import socketio
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -25,7 +21,6 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # CONFIG (from environment variables)
 # ─────────────────────────────────────────────
-ALERT_POLL_INTERVAL = int(os.getenv("ALERT_POLL_INTERVAL", "60"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "100"))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 _origins_list = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
@@ -46,11 +41,11 @@ if not GATEWAY_KEY:
 
 # ─────────────────────────────────────────────
 # GATEWAY VERIFICATION
-# Only your master gateway can call this backend
+# Only your master gateway can call protected routes
 # ─────────────────────────────────────────────
 async def verify_gateway(request: Request):
     """
-    Verifies every request came from the Ennex master gateway.
+    Verifies a request came from the Ennex master gateway.
     Rejects anything that doesn't carry the correct gateway key.
     """
     key = request.headers.get("X-Ennex-Backend-Key")
@@ -59,50 +54,13 @@ async def verify_gateway(request: Request):
         logger.warning(f"Unauthorized access attempt from {client_host}")
         raise HTTPException(status_code=403, detail="Forbidden")
 
-# ─────────────────────────────────────────────
-# IN-MEMORY STORE
-# ─────────────────────────────────────────────
-active_alerts: list[dict] = []
-
-# Bounded dedup tracking: deque enforces a max size (auto-evicts oldest),
-# set gives O(1) membership checks. Keep them in sync.
-PROCESSED_IDS_MAX = MAX_ALERTS * 10
-processed_alert_ids: set[str] = set()
-processed_alert_ids_order: deque = deque(maxlen=PROCESSED_IDS_MAX)
-
-
-def _mark_processed(alert_id: str) -> None:
-    """Add an alert id to the dedup set, evicting the oldest id once the
-    bounded deque is full so this can never grow without limit."""
-    if len(processed_alert_ids_order) == processed_alert_ids_order.maxlen:
-        oldest = processed_alert_ids_order[0]  # about to be evicted by append
-        processed_alert_ids.discard(oldest)
-    processed_alert_ids_order.append(alert_id)
-    processed_alert_ids.add(alert_id)
-
-
-# ─────────────────────────────────────────────
-# LIFESPAN
-# ─────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 Ennex weather backend starting...")
-    task = asyncio.create_task(alert_monitor_loop())
-    yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        logger.info("🛑 Alert monitor stopped cleanly.")
-
 
 # ─────────────────────────────────────────────
 # APP INIT
 # ─────────────────────────────────────────────
 app = FastAPI(
     title="Ennex — Real-Time Global Disaster & Weather API",
-    version="3.0.0",
-    lifespan=lifespan,
+    version="3.1.0-vercel",
 )
 
 app.add_middleware(
@@ -113,25 +71,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
-
 
 # ─────────────────────────────────────────────
 # REST ENDPOINTS
 # ─────────────────────────────────────────────
 
-# Health stays PUBLIC — Render needs this to verify service is alive
+# Health stays PUBLIC — platform needs this to verify service is alive
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "alerts_cached": len(active_alerts),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
 
-# All other routes protected by gateway verification
 @app.get("/api/weather")
 async def get_weather(
     lat: float = Query(..., description="Latitude"),
@@ -175,56 +128,47 @@ async def get_weather(
 
 
 @app.get("/api/alerts")
-def get_alerts(_=Depends(verify_gateway)):  # ← gateway verification added
+async def get_alerts(_=Depends(verify_gateway)):
+    """
+    Fetches disaster alerts live, on-demand, from USGS + GDACS + NASA EONET.
+    (Vercel serverless functions can't run a persistent background poller,
+    so this replaces the old always-on alert_monitor_loop — alerts are
+    pulled fresh each time this endpoint is called instead.)
+    """
+    seen_ids: set[str] = set()
+    alerts: list[dict] = []
+
+    await _fetch_usgs(alerts, seen_ids)
+    await _fetch_gdacs(alerts, seen_ids)
+    await _fetch_nasa_eonet(alerts, seen_ids)
+
+    alerts = alerts[:MAX_ALERTS]
+
     return {
-        "count": len(active_alerts),
-        "alerts": active_alerts,
+        "count": len(alerts),
+        "alerts": alerts,
         "last_updated": datetime.utcnow().isoformat(),
     }
 
 
 @app.get("/api/alerts/types")
-def get_alert_types(_=Depends(verify_gateway)):  # ← gateway verification added
-    types = list({a["type"] for a in active_alerts})
+async def get_alert_types(_=Depends(verify_gateway)):
+    seen_ids: set[str] = set()
+    alerts: list[dict] = []
+
+    await _fetch_usgs(alerts, seen_ids)
+    await _fetch_gdacs(alerts, seen_ids)
+    await _fetch_nasa_eonet(alerts, seen_ids)
+
+    types = list({a["type"] for a in alerts})
     return {"types": types}
-
-
-# ─────────────────────────────────────────────
-# BACKGROUND ALERT MONITOR
-# ─────────────────────────────────────────────
-
-async def alert_monitor_loop():
-    while True:
-        try:
-            logger.info("🔄 Polling global disaster feeds...")
-            new_alerts: list[dict] = []
-
-            await asyncio.gather(
-                _fetch_usgs(new_alerts),
-                _fetch_gdacs(new_alerts),
-                _fetch_nasa_eonet(new_alerts),
-            )
-
-            if new_alerts:
-                for alert in new_alerts:
-                    logger.info(f"🚨 [{alert['type']}] {alert['title']}")
-                    await sio.emit("emergency_alert", alert)
-                logger.info(f"✅ Broadcasted {len(new_alerts)} new alert(s).")
-
-            if len(active_alerts) > MAX_ALERTS:
-                active_alerts[:] = active_alerts[:MAX_ALERTS]
-
-        except Exception as e:
-            logger.error(f"Alert monitor error: {e}", exc_info=True)
-
-        await asyncio.sleep(ALERT_POLL_INTERVAL)
 
 
 # ─────────────────────────────────────────────
 # FEED 1 — USGS (Earthquakes)
 # ─────────────────────────────────────────────
 
-async def _fetch_usgs(new_alerts: list):
+async def _fetch_usgs(alerts: list, seen_ids: set):
     url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_hour.geojson"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -233,14 +177,14 @@ async def _fetch_usgs(new_alerts: list):
 
         for eq in r.json().get("features", []):
             alert_id = eq["id"]
-            if alert_id in processed_alert_ids:
+            if alert_id in seen_ids:
                 continue
-            _mark_processed(alert_id)
+            seen_ids.add(alert_id)
 
             props = eq["properties"]
             mag = props.get("mag", 0)
 
-            alert = {
+            alerts.append({
                 "id": alert_id,
                 "type": "EARTHQUAKE",
                 "title": props.get("title", "Earthquake Detected"),
@@ -251,9 +195,7 @@ async def _fetch_usgs(new_alerts: list):
                 "description": f"Magnitude {mag} earthquake near {props.get('place', 'unknown location')}.",
                 "source": "USGS",
                 "source_url": props.get("url", "https://earthquake.usgs.gov"),
-            }
-            new_alerts.append(alert)
-            active_alerts.insert(0, alert)
+            })
 
     except Exception as e:
         logger.warning(f"USGS feed error: {e}")
@@ -263,7 +205,7 @@ async def _fetch_usgs(new_alerts: list):
 # FEED 2 — GDACS
 # ─────────────────────────────────────────────
 
-async def _fetch_gdacs(new_alerts: list):
+async def _fetch_gdacs(alerts: list, seen_ids: set):
     url = "https://www.gdacs.org/xml/rss.xml"
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -290,9 +232,9 @@ async def _fetch_gdacs(new_alerts: list):
             alert_id = "gdacs_" + hashlib.md5(
                 (title + str(pub_date)).encode("utf-8")
             ).hexdigest()
-            if alert_id in processed_alert_ids:
+            if alert_id in seen_ids:
                 continue
-            _mark_processed(alert_id)
+            seen_ids.add(alert_id)
 
             event_type = _gdacs_event_type(title)
             severity = _gdacs_severity(title)
@@ -303,7 +245,7 @@ async def _fetch_gdacs(new_alerts: list):
             if lat_el is not None and lon_el is not None:
                 location = f"Lat {lat_el.text}, Lon {lon_el.text}"
 
-            alert = {
+            alerts.append({
                 "id": alert_id,
                 "type": event_type,
                 "title": title.strip(),
@@ -313,9 +255,7 @@ async def _fetch_gdacs(new_alerts: list):
                 "description": (description or title).strip(),
                 "source": "GDACS",
                 "source_url": link,
-            }
-            new_alerts.append(alert)
-            active_alerts.insert(0, alert)
+            })
 
     except Exception as e:
         logger.warning(f"GDACS feed error: {e}")
@@ -364,7 +304,7 @@ def _parse_rss_date(value: str) -> str:
 # FEED 3 — NASA EONET
 # ─────────────────────────────────────────────
 
-async def _fetch_nasa_eonet(new_alerts: list):
+async def _fetch_nasa_eonet(alerts: list, seen_ids: set):
     url = "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=20"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -373,9 +313,9 @@ async def _fetch_nasa_eonet(new_alerts: list):
 
         for event in r.json().get("events", []):
             alert_id = f"eonet_{event['id']}"
-            if alert_id in processed_alert_ids:
+            if alert_id in seen_ids:
                 continue
-            _mark_processed(alert_id)
+            seen_ids.add(alert_id)
 
             categories = [c["title"] for c in event.get("categories", [])]
             event_type = _eonet_event_type(categories)
@@ -393,7 +333,7 @@ async def _fetch_nasa_eonet(new_alerts: list):
             sources = event.get("sources", [])
             source_url = sources[0].get("url", "https://eonet.gsfc.nasa.gov") if sources else "https://eonet.gsfc.nasa.gov"
 
-            alert = {
+            alerts.append({
                 "id": alert_id,
                 "type": event_type,
                 "title": event.get("title", "Natural Event Detected"),
@@ -403,15 +343,13 @@ async def _fetch_nasa_eonet(new_alerts: list):
                 "description": f"Active {event_type.lower()} event tracked by NASA EONET: {event.get('title', '')}.",
                 "source": "NASA EONET",
                 "source_url": source_url,
-            }
-            new_alerts.append(alert)
-            active_alerts.insert(0, alert)
+            })
 
     except Exception as e:
         logger.warning(f"NASA EONET feed error: {e}")
 
 
-def _eonet_event_type(categories: list[str]) -> str:
+def _eonet_event_type(categories: list) -> str:
     joined = " ".join(categories).upper()
     if "WILDFIRE" in joined or "FIRE" in joined:
         return "WILDFIRE"
@@ -427,22 +365,6 @@ def _eonet_event_type(categories: list[str]) -> str:
         return "SEA_ICE"
     else:
         return "NATURAL_EVENT"
-
-
-# ─────────────────────────────────────────────
-# WEBSOCKET HANDLERS
-# ─────────────────────────────────────────────
-
-@sio.on("connect")
-async def on_connect(sid, environ):
-    logger.info(f"🔌 Client connected: {sid}")
-    if active_alerts:
-        await sio.emit("active_alerts_snapshot", active_alerts, to=sid)
-
-
-@sio.on("disconnect")
-async def on_disconnect(sid):
-    logger.info(f"❌ Client disconnected: {sid}")
 
 
 # ─────────────────────────────────────────────
