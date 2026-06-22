@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 import logging
 import os
@@ -38,6 +37,14 @@ if not GATEWAY_KEY:
     raise RuntimeError(
         "GATEWAY_KEY environment variable is not set. "
         "Refusing to start an unsecured backend."
+    )
+
+# OpenWeatherMap API key — get one free at https://openweathermap.org/api
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+if not OPENWEATHER_API_KEY:
+    raise RuntimeError(
+        "OPENWEATHER_API_KEY environment variable is not set. "
+        "Sign up free at https://openweathermap.org/api and set it."
     )
 
 # ─────────────────────────────────────────────
@@ -92,54 +99,46 @@ async def get_weather(
     lon: float = Query(..., description="Longitude"),
 ):
     """
-    Live weather from Open-Meteo — completely free, no API key needed.
+    Live weather from OpenWeatherMap, using a personal API key — avoids
+    the shared-IP rate limiting that free hosting platforms (like Render)
+    can run into with key-less providers such as Open-Meteo.
     Public endpoint: weather data isn't sensitive, so this is callable
     directly from the browser without the gateway key.
     """
     url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        f"&current_weather=true"
-        f"&hourly=relativehumidity_2m"
-        f"&timezone=auto"
+        f"https://api.openweathermap.org/data/2.5/weather"
+        f"?lat={lat}&lon={lon}"
+        f"&appid={OPENWEATHER_API_KEY}"
+        f"&units=metric"
     )
 
-    data = None
-    last_error = None
-    # Retry on 429 (rate limited) — Render's shared free-tier IP can get
-    # throttled by Open-Meteo even though our own request rate is low.
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url)
-                if r.status_code == 429:
-                    last_error = "rate limited (429)"
-                    await asyncio.sleep(1 + attempt)  # 1s, 2s, 3s backoff
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                break
-        except httpx.HTTPError as e:
-            last_error = str(e)
-            await asyncio.sleep(1 + attempt)
-
-    if data is None:
-        logger.error(f"Open-Meteo error after retries: {last_error}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        logger.error(f"OpenWeatherMap error: {e}")
         raise HTTPException(status_code=502, detail="Weather service unavailable.")
 
-    current = data.get("current_weather", {})
-    hourly = data.get("hourly", {})
+    main = data.get("main", {})
+    wind = data.get("wind", {})
+    weather_list = data.get("weather", [{}])
+    condition = weather_list[0].get("description", "Unknown").title() if weather_list else "Unknown"
+    sys_info = data.get("sys", {})
 
     return {
-        "location": {"lat": lat, "lon": lon},
-        "temperature": f"{current.get('temperature', 'N/A')}°C",
-        "wind_speed": f"{current.get('windspeed', 'N/A')} km/h",
-        "condition": _wmo_to_condition(current.get("weathercode", 0)),
-        "humidity": f"{(hourly.get('relativehumidity_2m') or [None])[0]}%",
-        "is_day": bool(current.get("is_day", 1)),
-        "timezone": data.get("timezone", "UTC"),
-        "timestamp": current.get("time", datetime.utcnow().isoformat()),
-        "source": "Open-Meteo",
+        "location": {"lat": lat, "lon": lon, "name": data.get("name", "")},
+        "temperature": f"{main.get('temp', 'N/A')}°C",
+        "feels_like": f"{main.get('feels_like', 'N/A')}°C",
+        "wind_speed": f"{wind.get('speed', 'N/A')} m/s",
+        "condition": condition,
+        "humidity": f"{main.get('humidity', 'N/A')}%",
+        "is_day": sys_info.get("sunset", 0) > sys_info.get("sunrise", 0)
+                  and datetime.utcnow().timestamp() < sys_info.get("sunset", 0),
+        "timezone_offset_seconds": data.get("timezone", 0),
+        "timestamp": datetime.utcnow().isoformat(),
+        "source": "OpenWeatherMap",
     }
 
 
@@ -387,15 +386,3 @@ def _eonet_event_type(categories: list) -> str:
 # HELPERS
 # ─────────────────────────────────────────────
 
-def _wmo_to_condition(code: int) -> str:
-    mapping = {
-        0: "Clear Sky",
-        1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
-        45: "Foggy", 48: "Icy Fog",
-        51: "Light Drizzle", 53: "Moderate Drizzle", 55: "Dense Drizzle",
-        61: "Light Rain", 63: "Moderate Rain", 65: "Heavy Rain",
-        71: "Light Snow", 73: "Moderate Snow", 75: "Heavy Snow",
-        80: "Rain Showers", 81: "Moderate Showers", 82: "Violent Showers",
-        95: "Thunderstorm", 96: "Thunderstorm with Hail", 99: "Heavy Thunderstorm",
-    }
-    return mapping.get(code, "Unknown")
